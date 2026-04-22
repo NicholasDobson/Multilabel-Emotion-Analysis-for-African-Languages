@@ -145,20 +145,6 @@ We fine-tune:
 - AfriSenti (EMNLP 2023)  
 - SemEval-2025 Task 11  
 
----
-
-## Repository Structure (predicted)
-├── data/
-├── models/
-├── notebooks/
-├── src/
-│   ├── preprocessing/
-│   ├── training/
-│   ├── augmentation/
-│   └── evaluation/
-├── results/
-├── README.md
-└── requirements.txt
 
 ---
 
