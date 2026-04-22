@@ -2,7 +2,7 @@
 **Transfer Learning + Data Augmentation on BRIGHTER & EthioEmo**
 
 **Authors:** Nicholas Dobson, Simon van der Merwe, Naazneen Khan  
-**Course:** COS 760 – University of Pretoria (2026)
+**Course:** Natural Language Processing COS 760 – University of Pretoria (2026)
 
 ---
 
