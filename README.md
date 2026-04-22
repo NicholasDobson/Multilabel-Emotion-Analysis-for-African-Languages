@@ -152,10 +152,10 @@ We fine-tune:
 ├── models/
 ├── notebooks/
 ├── src/
-│ ├── preprocessing/
-│ ├── training/
-│ ├── augmentation/
-│ └── evaluation/
+│   ├── preprocessing/
+│   ├── training/
+│   ├── augmentation/
+│   └── evaluation/
 ├── results/
 ├── README.md
 └── requirements.txt
