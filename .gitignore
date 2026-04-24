@@ -1,0 +1,21 @@
+
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+
+# Runtime artifacts (generated at run time — too large for git)
+data/
+models/
+outputs/
+
+# Results can be committed selectively
+# results/
+
+# HuggingFace cache
+.cache/
