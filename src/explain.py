@@ -70,35 +70,38 @@ class EmotionClassifier(nn.Module):
         return logits, outputs.attentions, outputs.last_hidden_state
 
 
-def load_trained_model(model_name: str, lang: str, device: str = "cpu"):
+def load_trained_model(model_name: str, lang: str, device: str = "cpu", models_dir: str = "models"):
     """
-    Load a trained model checkpoint from models/{model_name}/{lang}/best_model.pt
-    Returns (model, tokenizer, config) or None if not found.
+    Load a trained model checkpoint from {models_dir}/{model_name}/{lang}/best_model.pt
+    Also loads per-class thresholds from the paired results/metrics.json if available.
+    Returns (model, tokenizer, thresholds) or (None, None, None) if not found.
     """
-    checkpoint_path = Path("models") / model_name / lang / "best_model.pt"
+    checkpoint_path = Path(models_dir) / model_name / lang / "best_model.pt"
 
     if not checkpoint_path.exists():
         logger.error(f"Checkpoint not found: {checkpoint_path}")
-        logger.info(f"Available checkpoints should be in: models/{model_name}/{lang}/")
         return None, None, None
 
     try:
         model = EmotionClassifier(SUPPORTED_MODELS[model_name])
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
         model.to(device)
         model.eval()
 
         tokenizer = AutoTokenizer.from_pretrained(SUPPORTED_MODELS[model_name])
 
-        # Load config if available
-        config_path = checkpoint_path.parent / "config.json"
-        config = {}
-        if config_path.exists():
-            with open(config_path) as f:
-                config = json.load(f)
+        # Load per-class thresholds saved by train.py; fall back to 0.5 per class
+        thresholds = np.full(len(EMOTIONS), 0.5)
+        metrics_path = Path("results") / model_name / lang / "metrics.json"
+        if metrics_path.exists():
+            with open(metrics_path) as f:
+                saved = json.load(f)
+            if "thresholds" in saved:
+                thresholds = np.array([saved["thresholds"].get(e, 0.5) for e in EMOTIONS])
+                logger.info(f"Loaded per-class thresholds from {metrics_path}")
 
         logger.info(f"Loaded model from {checkpoint_path}")
-        return model, tokenizer, config
+        return model, tokenizer, thresholds
 
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
@@ -110,34 +113,29 @@ def predict_emotions(
     tokenizer: AutoTokenizer,
     text: str,
     device: str = "cpu",
-    threshold: float = 0.5
-) -> Tuple[Dict, np.ndarray]:
+    thresholds: np.ndarray = None,
+) -> Tuple[Dict, np.ndarray, Tuple, torch.Tensor, Dict]:
     """
-    Predict emotions for a text and return predictions + probabilities.
-    Returns (predictions_dict, logits).
+    Predict emotions using per-class thresholds (from train.py optimisation).
+    Falls back to 0.5 per class if thresholds not provided.
     """
-    inputs = tokenizer(
-        text,
-        truncation=True,
-        padding=True,
-        max_length=512,
-        return_tensors="pt"
-    )
+    if thresholds is None:
+        thresholds = np.full(len(EMOTIONS), 0.5)
 
+    inputs = tokenizer(text, truncation=True, padding=True, max_length=512, return_tensors="pt")
     input_ids = inputs["input_ids"].to(device)
     attention_mask = inputs["attention_mask"].to(device)
 
     with torch.no_grad():
         logits, attentions, hidden_states = model(input_ids, attention_mask)
 
-    # Convert logits to probabilities
     probs = torch.sigmoid(logits).cpu().numpy()[0]
 
-    # Threshold predictions
     predictions = {
         emotion: {
             "probability": float(probs[i]),
-            "predicted": bool(probs[i] > threshold)
+            "threshold": float(thresholds[i]),
+            "predicted": bool(probs[i] >= thresholds[i]),
         }
         for i, emotion in enumerate(EMOTIONS)
     }
@@ -261,13 +259,13 @@ def compare_attention_across_languages(
     for lang in languages:
         logger.info(f"\nAnalyzing {model_name} on {lang}...")
 
-        model, tokenizer, _ = load_trained_model(model_name, lang, device)
+        model, tokenizer, thresholds = load_trained_model(model_name, lang, device)
         if model is None:
             logger.warning(f"Skipping {lang} (model not found)")
             continue
 
         predictions, probs, attentions, _, inputs = predict_emotions(
-            model, tokenizer, text, device
+            model, tokenizer, text, device, thresholds
         )
 
         tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
@@ -316,7 +314,7 @@ def identify_culturally_specific_cues(
         logger.error(f"Failed to load data for {lang}: {e}")
         return {}
 
-    model, tokenizer, _ = load_trained_model(model_name, lang, device)
+    model, tokenizer, thresholds = load_trained_model(model_name, lang, device)
     if model is None:
         return {}
 
@@ -336,7 +334,7 @@ def identify_culturally_specific_cues(
 
         try:
             predictions, _, attentions, _, inputs = predict_emotions(
-                model, tokenizer, text, device
+                model, tokenizer, text, device, thresholds
             )
 
             tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
@@ -473,24 +471,23 @@ def main():
         logger.info(f"Model: {args.model}, Language: {args.lang}")
         logger.info(f"{'='*60}\n")
 
-        model, tokenizer, config = load_trained_model(args.model, args.lang, args.device)
+        model, tokenizer, thresholds = load_trained_model(args.model, args.lang, args.device)
         if model is None:
             logger.error("Failed to load model. Exiting.")
             return
 
         predictions, probs, attentions, hidden_states, inputs = predict_emotions(
-            model, tokenizer, args.text, args.device
+            model, tokenizer, args.text, args.device, thresholds
         )
 
         tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
 
-        # Print predictions
-        logger.info("Emotion Predictions:")
+        # Print all probabilities so borderline predictions are visible
+        logger.info("Emotion Predictions (prob / threshold):")
         logger.info("-" * 40)
         for emotion, pred in predictions.items():
-            prob = pred["probability"]
             status = "✓" if pred["predicted"] else "✗"
-            logger.info(f"  {status} {emotion:12} {prob:.4f}")
+            logger.info(f"  {status} {emotion:12} {pred['probability']:.4f}  (threshold={pred['threshold']:.2f})")
 
         # Extract and print token importance
         token_importance = extract_token_importance(
@@ -500,10 +497,10 @@ def main():
             method="attention_rollout"
         )
 
-        logger.info("\nToken Importance (Top-10):")
+        logger.info("\nToken Importance (Top-5):")
         logger.info("-" * 40)
         sorted_tokens = sorted(token_importance.items(), key=lambda x: x[1], reverse=True)
-        for token, score in sorted_tokens[:10]:
+        for token, score in sorted_tokens[:5]:
             logger.info(f"  {token:15} {score:.4f}")
 
         # Visualize attention

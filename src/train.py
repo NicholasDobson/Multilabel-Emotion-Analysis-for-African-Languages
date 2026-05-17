@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
 sys.path.insert(0, str(Path(__file__).parent))
 from utils import (
@@ -23,6 +23,7 @@ from utils import (
     TEXT_COL,
     compute_metrics,
     compute_pos_weights,
+    find_optimal_thresholds,
     load_language_data,
     majority_label_baseline,
 )
@@ -62,26 +63,28 @@ class EmotionDataset(Dataset):
 
 
 class EmotionClassifier(nn.Module):
-    def __init__(self, model_name: str, num_labels: int = len(EMOTIONS)):
+    def __init__(self, model_name: str, num_labels: int = len(EMOTIONS), dropout: float = 0.1):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(model_name)
+        self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(self.encoder.config.hidden_size, num_labels)
 
     def forward(self, input_ids, attention_mask):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        cls = outputs.last_hidden_state[:, 0, :]
+        cls = self.dropout(outputs.last_hidden_state[:, 0, :])
         return self.classifier(cls)
 
 
-def run_epoch(model, loader, criterion, device, optimizer=None):
+def run_epoch(model, loader, criterion, device, optimizer=None, scheduler=None, scaler=None):
     """
     Run one epoch. Pass optimizer for training; omit for evaluation.
-    Returns (avg_loss, predictions_array, labels_array).
+    Returns (avg_loss, probs_array, predictions_array, labels_array).
     """
     training = optimizer is not None
+    use_amp = scaler is not None
     model.train(training)
     total_loss = 0.0
-    all_preds, all_labels = [], []
+    all_probs, all_preds, all_labels = [], [], []
 
     ctx = nullcontext() if training else torch.no_grad()
     with ctx:
@@ -90,21 +93,34 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            logits = model(input_ids, attention_mask)
-            loss = criterion(logits, labels)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(input_ids, attention_mask)
+                loss = criterion(logits, labels)
 
             if training:
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
 
             total_loss += loss.item()
-            preds = (torch.sigmoid(logits) >= 0.5).int().cpu().numpy()
-            all_preds.append(preds)
+            probs = torch.sigmoid(logits.detach()).cpu().float().numpy()
+            all_probs.append(probs)
+            all_preds.append((probs >= 0.5).astype(int))
             all_labels.append(batch["labels"].int().numpy())
 
     return (
         total_loss / len(loader),
+        np.vstack(all_probs),
         np.vstack(all_preds),
         np.vstack(all_labels),
     )
@@ -124,8 +140,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--patience", type=int, default=2, help="Early stopping patience on val macro-F1")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate on classifier head")
     parser.add_argument("--data_dir", default=None, help="Load augmented dataset from local path (output of augment.py)")
-    parser.add_argument("--gpu_limit", type=float, default=0.8, help="Limit GPU memory usage fraction (0.0 to 1.0)")
     parser.add_argument("--output_suffix", type=str, default="", help="Suffix for results and models directories (e.g. '_combined')")
     args = parser.parse_args()
 
@@ -182,10 +198,15 @@ def main():
     test_loader = DataLoader(test_ds, batch_size=args.batch_size)
 
     # ── Model, loss, optimiser ────────────────────────────────────────────────
-    model = EmotionClassifier(model_name).to(device)
+    model = EmotionClassifier(model_name, dropout=args.dropout).to(device)
     pos_weights = compute_pos_weights(train_labels.astype(int)).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
     optimizer = AdamW(model.parameters(), lr=args.lr)
+
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = max(1, total_steps // 10)
+    scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    scaler = torch.amp.GradScaler() if device.type == "cuda" else None
 
     # ── Training loop with early stopping ─────────────────────────────────────
     models_dir = f"models{args.output_suffix}"
@@ -194,11 +215,13 @@ def main():
     checkpoint_path = checkpoint_dir / "best_model.pt"
 
     best_val_f1 = -1.0
+    best_val_probs = None
+    best_val_true = None
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, _, _ = run_epoch(model, train_loader, criterion, device, optimizer=optimizer)
-        _, val_preds, val_true = run_epoch(model, val_loader, criterion, device)
+        train_loss, _, _, _ = run_epoch(model, train_loader, criterion, device, optimizer=optimizer, scheduler=scheduler, scaler=scaler)
+        _, val_probs, val_preds, val_true = run_epoch(model, val_loader, criterion, device)
 
         val_metrics = compute_metrics(val_true, val_preds)
         val_f1 = val_metrics["macro_f1"]
@@ -206,6 +229,8 @@ def main():
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
+            best_val_probs = val_probs
+            best_val_true = val_true
             patience_counter = 0
             torch.save(model.state_dict(), checkpoint_path)
             logger.info(f"  → Best checkpoint saved (val_f1={val_f1:.4f})")
@@ -216,12 +241,18 @@ def main():
                 logger.info(f"Early stopping at epoch {epoch}")
                 break
 
+    # ── Per-class threshold optimisation on best validation probs ─────────────
+    thresholds = find_optimal_thresholds(best_val_true, best_val_probs)
+    logger.info(f"Optimal thresholds: { {e: round(float(t), 2) for e, t in zip(EMOTIONS, thresholds)} }")
+
     # ── Test evaluation ───────────────────────────────────────────────────────
     model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
-    _, test_preds, test_true = run_epoch(model, test_loader, criterion, device)
+    _, test_probs, _, test_true = run_epoch(model, test_loader, criterion, device)
+    test_preds = (test_probs >= thresholds).astype(int)
 
     test_metrics = compute_metrics(test_true, test_preds)
     test_metrics["majority_label_baseline"] = baseline
+    test_metrics["thresholds"] = {e: round(float(t), 4) for e, t in zip(EMOTIONS, thresholds)}
 
     results_dir = f"results{args.output_suffix}"
     results_path = Path(results_dir) / args.model / args.lang / "metrics.json"

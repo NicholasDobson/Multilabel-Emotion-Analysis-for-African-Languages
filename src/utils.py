@@ -182,6 +182,27 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return {"macro_f1": macro_f1, "jaccard": jaccard, "per_class": per_class}
 
 
+def find_optimal_thresholds(
+    val_true: np.ndarray, val_probs: np.ndarray, candidates=None
+) -> np.ndarray:
+    """
+    Find the per-class sigmoid threshold that maximises F1 on the validation set.
+    Returns array of shape (num_labels,). Use instead of a fixed 0.5 threshold.
+    """
+    if candidates is None:
+        candidates = np.arange(0.3, 0.71, 0.05)
+    thresholds = []
+    for i in range(val_true.shape[1]):
+        best_t, best_f1 = 0.5, -1.0
+        for t in candidates:
+            preds = (val_probs[:, i] >= t).astype(int)
+            score = f1_score(val_true[:, i], preds, zero_division=0)
+            if score > best_f1:
+                best_f1, best_t = score, float(t)
+        thresholds.append(best_t)
+    return np.array(thresholds)
+
+
 def majority_label_baseline(train_labels: np.ndarray, test_labels: np.ndarray) -> dict:
     """Predict the most frequent label combination from train for every test example."""
     counter = Counter(tuple(row) for row in train_labels)
