@@ -125,10 +125,16 @@ def main():
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--patience", type=int, default=2, help="Early stopping patience on val macro-F1")
     parser.add_argument("--data_dir", default=None, help="Load augmented dataset from local path (output of augment.py)")
+    parser.add_argument("--gpu_limit", type=float, default=0.8, help="Limit GPU memory usage fraction (0.0 to 1.0)")
+    parser.add_argument("--output_suffix", type=str, default="", help="Suffix for results and models directories (e.g. '_combined')")
     args = parser.parse_args()
 
     model_name = SUPPORTED_MODELS[args.model]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Limit GPU memory - removed torch.cuda.set_per_process_memory_fraction
+    # as it frequently causes kernel panics/hard crashes on AMD GPUs (ROCm).
+
     logger.info(f"Model: {model_name} | Lang: {args.lang} | Device: {device}")
 
     # ── Data loading ─────────────────────────────────────────────────────────
@@ -182,7 +188,8 @@ def main():
     optimizer = AdamW(model.parameters(), lr=args.lr)
 
     # ── Training loop with early stopping ─────────────────────────────────────
-    checkpoint_dir = Path("models") / args.model / args.lang
+    models_dir = f"models{args.output_suffix}"
+    checkpoint_dir = Path(models_dir) / args.model / args.lang
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / "best_model.pt"
 
@@ -216,7 +223,8 @@ def main():
     test_metrics = compute_metrics(test_true, test_preds)
     test_metrics["majority_label_baseline"] = baseline
 
-    results_path = Path("results") / args.model / args.lang / "metrics.json"
+    results_dir = f"results{args.output_suffix}"
+    results_path = Path(results_dir) / args.model / args.lang / "metrics.json"
     results_path.parent.mkdir(parents=True, exist_ok=True)
     with open(results_path, "w") as f:
         json.dump(test_metrics, f, indent=2)

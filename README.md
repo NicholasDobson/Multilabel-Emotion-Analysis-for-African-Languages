@@ -165,6 +165,11 @@ requirements.txt
 
 ### Stage 1 — Train a baseline model
 ```bash
+# Baseline Models: mBERT, XLM-RoBERTa-base, and AfroXLMR 
+# Languages Chosen: Afrikaans, Amheric, Swahili, isiZulu, isiXhosa
+# Lang codes Brighter: afr, swa, zul, xho
+# Lang codes Ethio: amh
+
 # Fine-tune XLM-RoBERTa on Swahili Takes far too long 
 python3 src/train.py --model xlm-roberta --lang swa 
 # Smaller version
