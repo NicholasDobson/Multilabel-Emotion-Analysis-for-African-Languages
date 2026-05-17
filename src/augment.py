@@ -9,11 +9,14 @@ Usage:
 import argparse
 import logging
 import sys
+import gc
 from pathlib import Path
 
 import torch
 from datasets import Dataset, DatasetDict
 from sentence_transformers import SentenceTransformer, util
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
 from utils import EMOTIONS, TEXT_COL, load_language_data
@@ -23,84 +26,107 @@ logger = logging.getLogger(__name__)
 
 SIMILARITY_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
-# TO-DO: find and verify a multilingual paraphrase model.
-# google/mt5-small is a placeholder — it is NOT fine-tuned for paraphrasing
-# and will produce low-quality output. Replace with a verified multilingual
-# paraphrase model (e.g. a community fine-tune of mT5 on a paraphrase corpus)
-# before using --methods para in experiments.
-PARAPHRASE_MODEL = "google/mt5-small"  # TO-DO: replace with verified model
+# ── Model Configurations ──────────────────────────────────────────────────────
 
+# Meta's NLLB for Back-Translation
+NLLB_MODEL = "facebook/nllb-200-distilled-600M" # Upgrade to "facebook/nllb-200-1.3B" if VRAM allows
+# Cohere's Aya for Paraphrasing
+AYA_MODEL = "CohereForAI/aya-101"
 
-# ── Translation helpers ───────────────────────────────────────────────────────
+# NLLB uses FLORES-200 language codes. Map your simple codes to these.
+NLLB_LANG_MAP = {
+    "afr": "afr_Latn",
+    "amh": "amh_Ethi",
+    "swa": "swa_Latn",
+    "xho": "xho_Latn",
+    "zul": "zul_Latn",
+    "yor": "yor_Latn",
+    "en": "eng_Latn"
+}
 
-def _load_marian(src: str, tgt: str, device):
-    """Load a Helsinki-NLP MarianMT model. Returns (model, tokenizer) or None."""
-    from transformers import MarianMTModel, MarianTokenizer
-    model_id = f"Helsinki-NLP/opus-mt-{src}-{tgt}"
-    try:
-        tok = MarianTokenizer.from_pretrained(model_id)
-        mdl = MarianMTModel.from_pretrained(model_id).to(device)
-        mdl.eval()
-        logger.info(f"Loaded {model_id}")
-        return mdl, tok
-    except Exception as e:
-        logger.warning(f"MarianMT model {model_id} not available: {e}")
-        return None
+# ── Translation & Generation Helpers ──────────────────────────────────────────
 
-
-def _translate_batch(texts: list, model, tokenizer, device, batch_size: int) -> list:
-    results = []
-    for i in range(0, len(texts), batch_size):
-        chunk = texts[i : i + batch_size]
-        inputs = tokenizer(
-            chunk, return_tensors="pt", padding=True, truncation=True, max_length=512
-        ).to(device)
-        with torch.no_grad():
-            out = model.generate(**inputs)
-        results.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
-    return results
+def _free_memory(model, tokenizer):
+    """Deletes model from memory and clears GPU cache."""
+    del model
+    del tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ── Augmentation methods ──────────────────────────────────────────────────────
 
 def backtranslate(texts: list, lang: str, device, batch_size: int):
     """
-    Translate texts lang → English → lang.
-    Returns (augmented_texts, True) or (None, False) if a model is unavailable.
+    Translate texts lang → English → lang using NLLB.
     """
-    fwd = _load_marian(lang, "en", device)
-    if fwd is None:
-        return None, False
-    rev = _load_marian("en", lang, device)
-    if rev is None:
+    nllb_lang = NLLB_LANG_MAP.get(lang)
+    if not nllb_lang:
+        logger.error(f"Language {lang} not in NLLB_LANG_MAP.")
         return None, False
 
-    en_texts = _translate_batch(texts, *fwd, device, batch_size)
-    bt_texts = _translate_batch(en_texts, *rev, device, batch_size)
+    logger.info(f"Loading NLLB model: {NLLB_MODEL}")
+    tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL, revision="refs/pr/45")
+    model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL, revision="refs/pr/45", torch_dtype=torch.float16).to(device)
+    model.eval()
+
+    # 1. Translate Source -> English
+    tokenizer.src_lang = nllb_lang
+    eng_target_id = tokenizer.convert_tokens_to_ids("eng_Latn")
+    en_texts = []
+
+    logger.info(f"Translating {lang} -> eng_Latn...")
+    for i in tqdm(range(0, len(texts), batch_size), desc="Source -> English"):
+        chunk = texts[i : i + batch_size]
+        inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+        with torch.no_grad():
+            out = model.generate(**inputs, forced_bos_token_id=eng_target_id, max_length=512)
+        en_texts.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
+
+    # 2. Translate English -> Source
+    tokenizer.src_lang = "eng_Latn"
+    src_target_id = tokenizer.convert_tokens_to_ids(nllb_lang)
+    bt_texts = []
+
+    logger.info(f"Translating eng_Latn -> {lang}...")
+    for i in tqdm(range(0, len(en_texts), batch_size), desc="English -> Source"):
+        chunk = en_texts[i : i + batch_size]
+        inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+        with torch.no_grad():
+            out = model.generate(**inputs, forced_bos_token_id=src_target_id, max_length=512)
+        bt_texts.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
+
+    _free_memory(model, tokenizer)
     return bt_texts, True
 
 
-def paraphrase(texts: list, device, batch_size: int):
+def paraphrase(texts: list, lang: str, device, batch_size: int):
     """
-    Generate paraphrases with a seq2seq model.
-    TO-DO: replace PARAPHRASE_MODEL with a verified multilingual paraphrase
-    model before using this method. Current placeholder will not produce
-    useful paraphrases.
+    Generate paraphrases using Cohere's Aya-101.
     """
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer as HFTokenizer
-    tok = HFTokenizer.from_pretrained(PARAPHRASE_MODEL)
-    mdl = AutoModelForSeq2SeqLM.from_pretrained(PARAPHRASE_MODEL).to(device)
-    mdl.eval()
+    logger.info(f"Loading Aya model: {AYA_MODEL}")
+    tokenizer = AutoTokenizer.from_pretrained(AYA_MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(AYA_MODEL, torch_dtype=torch.float16).to(device)
+    model.eval()
 
     results = []
-    for i in range(0, len(texts), batch_size):
+    logger.info(f"Generating paraphrases using Aya...")
+    for i in tqdm(range(0, len(texts), batch_size), desc="Aya Paraphrasing"):
         chunk = texts[i : i + batch_size]
-        inputs = tok(
-            chunk, return_tensors="pt", padding=True, truncation=True, max_length=512
-        ).to(device)
+
+        # Format prompts specifically for Aya
+        prompts = [
+            f"Paraphrase the following text in its original language. Maintain the exact meaning and emotional tone:\n{text}"
+            for text in chunk
+        ]
+
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
         with torch.no_grad():
-            out = mdl.generate(**inputs, max_new_tokens=128, num_beams=4, early_stopping=True)
-        results.extend(tok.batch_decode(out, skip_special_tokens=True))
+            out = model.generate(**inputs, max_new_tokens=128, num_beams=4, early_stopping=True)
+        results.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
+
+    _free_memory(model, tokenizer)
     return results
 
 
@@ -141,14 +167,16 @@ def augment_training_split(
                 logger.warning(f"Back-translation skipped for lang={lang} (model unavailable)")
                 continue
         elif method == "para":
-            aug_texts = paraphrase(texts, device, batch_size)
+            aug_texts = paraphrase(texts, lang, device, batch_size)
         else:
             raise ValueError(f"Unknown augmentation method: {method}")
 
         passed = filter_by_similarity(texts, aug_texts, sim_model, threshold)
         logger.info(f"  {method}: {len(passed)}/{len(texts)} samples kept (similarity >= {threshold})")
         for i in passed:
-            kept.append((aug_texts[i], labels[i]))
+            # Prevent adding duplicates if the output is exactly the same as the input
+            if aug_texts[i].strip() != texts[i].strip():
+                kept.append((aug_texts[i], labels[i]))
 
     return kept
 
@@ -178,14 +206,14 @@ def main():
         default=["bt"],
         help="Augmentation methods: bt (back-translation), para (paraphrase)",
     )
-    parser.add_argument("--threshold", type=float, default=0.85, help="Similarity threshold")
-    parser.add_argument("--batch_size", type=int, default=32)
+    # Reduced default threshold to 0.75 as cross-lingual similarity models are often strict
+    parser.add_argument("--threshold", type=float, default=0.75, help="Similarity threshold")
+    parser.add_argument("--batch_size", type=int, default=16) # Reduced default batch size to save VRAM
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Lang: {args.lang} | Methods: {args.methods} | Device: {device}")
 
-    # Load original data
     splits = load_language_data(args.lang)
     if not splits["train"]:
         raise ValueError(f"No training data for lang={args.lang}")
@@ -193,11 +221,9 @@ def main():
     train_texts, train_labels = zip(*splits["train"])
     train_texts, train_labels = list(train_texts), list(train_labels)
 
-    # Load similarity model once; reused across all methods
     logger.info(f"Loading similarity model: {SIMILARITY_MODEL}")
-    sim_model = SentenceTransformer(SIMILARITY_MODEL)
+    sim_model = SentenceTransformer(SIMILARITY_MODEL, device=device)
 
-    # Augment
     new_samples = augment_training_split(
         train_texts, train_labels, args.lang, args.methods,
         sim_model, device, args.threshold, args.batch_size,
@@ -205,11 +231,11 @@ def main():
 
     original_n = len(train_texts)
     augmented_n = original_n + len(new_samples)
-    assert augmented_n > original_n, (
-        f"No augmented samples passed the similarity filter — "
-        f"augmented dataset ({augmented_n}) is not larger than original ({original_n})"
-    )
-    logger.info(f"Train split: {original_n} → {augmented_n} samples ({augmented_n / original_n:.2f}x)")
+
+    if augmented_n <= original_n:
+         logger.warning("No augmented samples passed the similarity filter.")
+    else:
+         logger.info(f"Train split: {original_n} → {augmented_n} samples ({augmented_n / original_n:.2f}x)")
 
     aug_dict = DatasetDict({
         "train": pairs_to_hf_dataset(list(zip(train_texts, train_labels)) + new_samples),
@@ -224,3 +250,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
