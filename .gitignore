@@ -8,6 +8,7 @@ __pycache__/
 .env
 .venv/
 venv/
+venv_rocm/
 
 # Runtime artifacts (generated at run time — too large for git)
 data/
@@ -15,7 +16,9 @@ models/
 outputs/
 
 # Results can be committed selectively
-# results/
+results/
+logs/
+
 
 # HuggingFace cache
 .cache/
