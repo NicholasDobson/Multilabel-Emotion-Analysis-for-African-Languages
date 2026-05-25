@@ -1,12 +1,3 @@
-"""
-Stage 2: Modular data augmentation pipeline for multilabel emotion classification.
-
-Usage:
-  python src/augment.py --lang amh --methods bt
-  python src/augment.py --lang afr --methods bt para
-  python src/augment.py --lang amh --methods bt --verify_labels
-"""
-
 import argparse
 import logging
 import sys
@@ -28,14 +19,9 @@ logger = logging.getLogger(__name__)
 
 SIMILARITY_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
-# ── Model Configurations ──────────────────────────────────────────────────────
-
-# Meta's NLLB for Back-Translation
-NLLB_MODEL = "facebook/nllb-200-distilled-600M" # Upgrade to "facebook/nllb-200-1.3B" if VRAM allows
-# Cohere's Aya for Paraphrasing
+NLLB_MODEL = "facebook/nllb-200-distilled-600M" 
 AYA_MODEL = "CohereForAI/aya-101"
 
-# NLLB uses FLORES-200 language codes. Map your simple codes to these.
 NLLB_LANG_MAP = {
     "afr": "afr_Latn",
     "amh": "amh_Ethi",
@@ -46,23 +32,16 @@ NLLB_LANG_MAP = {
     "en": "eng_Latn"
 }
 
-# ── Translation & Generation Helpers ──────────────────────────────────────────
-
 def _free_memory(model, tokenizer):
-    """Deletes model from memory and clears GPU cache."""
+    # clean up the mess we made on the GPU
     del model
     del tokenizer
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-
-# ── Augmentation methods ──────────────────────────────────────────────────────
-
 def backtranslate(texts: list, lang: str, device, batch_size: int):
-    """
-    Translate texts lang → English → lang using NLLB.
-    """
+    # taking a scenic detour through English to get new perspectives
     nllb_lang = NLLB_LANG_MAP.get(lang)
     if not nllb_lang:
         logger.error(f"Language {lang} not in NLLB_LANG_MAP.")
@@ -73,7 +52,6 @@ def backtranslate(texts: list, lang: str, device, batch_size: int):
     model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL, revision="refs/pr/45", torch_dtype=torch.float16).to(device)
     model.eval()
 
-    # 1. Translate Source -> English
     tokenizer.src_lang = nllb_lang
     eng_target_id = tokenizer.convert_tokens_to_ids("eng_Latn")
     en_texts = []
@@ -86,7 +64,6 @@ def backtranslate(texts: list, lang: str, device, batch_size: int):
             out = model.generate(**inputs, forced_bos_token_id=eng_target_id, max_length=512)
         en_texts.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
 
-    # 2. Translate English -> Source
     tokenizer.src_lang = "eng_Latn"
     src_target_id = tokenizer.convert_tokens_to_ids(nllb_lang)
     bt_texts = []
@@ -102,11 +79,7 @@ def backtranslate(texts: list, lang: str, device, batch_size: int):
     _free_memory(model, tokenizer)
     return bt_texts, True
 
-
 def paraphrase(texts: list, lang: str, device, batch_size: int):
-    """
-    Generate paraphrases using Cohere's Aya-101.
-    """
     logger.info(f"Loading Aya model: {AYA_MODEL}")
     tokenizer = AutoTokenizer.from_pretrained(AYA_MODEL)
     model = AutoModelForSeq2SeqLM.from_pretrained(AYA_MODEL, torch_dtype=torch.float16).to(device)
@@ -117,7 +90,6 @@ def paraphrase(texts: list, lang: str, device, batch_size: int):
     for i in tqdm(range(0, len(texts), batch_size), desc="Aya Paraphrasing"):
         chunk = texts[i : i + batch_size]
 
-        # Format prompts specifically for Aya
         prompts = [
             f"Paraphrase the following text in its original language. Maintain the exact meaning and emotional tone:\n{text}"
             for text in chunk
@@ -131,31 +103,16 @@ def paraphrase(texts: list, lang: str, device, batch_size: int):
     _free_memory(model, tokenizer)
     return results
 
-
-# ── Quality filter ────────────────────────────────────────────────────────────
-
 def filter_by_similarity(
     originals: list, augmented: list, sim_model: SentenceTransformer, threshold: float
 ) -> list:
-    """Return indices where cosine similarity(original, augmented) >= threshold."""
     orig_emb = sim_model.encode(originals, convert_to_tensor=True, show_progress_bar=False)
     aug_emb = sim_model.encode(augmented, convert_to_tensor=True, show_progress_bar=False)
     similarities = util.cos_sim(orig_emb, aug_emb).diagonal().cpu().numpy()
     return [i for i, s in enumerate(similarities) if float(s) >= threshold]
 
-
-# ── Minority-class identification ─────────────────────────────────────────────
-
 def identify_minority_samples(train_texts, train_labels):
-    """
-    Identify samples containing at least one minority-class label.
-    Minority labels are those with frequency below the median count.
-
-    Returns:
-        minority_texts: list of texts for minority samples
-        minority_labels: list of label vectors for minority samples
-        minority_mask: boolean array indicating which labels are minority
-    """
+    # finding the underdogs in our dataset that need some extra love
     labels_array = np.array(train_labels)
     label_counts = labels_array.sum(axis=0)
     median_count = np.median(label_counts)
@@ -166,7 +123,6 @@ def identify_minority_samples(train_texts, train_labels):
     logger.info(f"Median count: {median_count:.0f}")
     logger.info(f"Minority labels (below median): {minority_label_names}")
 
-    # Only keep samples that contain at least one minority label
     minority_indices = [
         i for i, lbls in enumerate(train_labels)
         if any(lbls[j] == 1 for j in range(len(EMOTIONS)) if minority_mask[j])
@@ -179,9 +135,6 @@ def identify_minority_samples(train_texts, train_labels):
 
     return minority_texts, minority_labels, minority_mask
 
-
-# ── Core augmentation loop ────────────────────────────────────────────────────
-
 def augment_training_split(
     texts: list,
     labels: list,
@@ -192,10 +145,6 @@ def augment_training_split(
     threshold: float,
     batch_size: int,
 ) -> list:
-    """
-    Apply each enabled augmentation method, filter by similarity, and return
-    a list of (text, labels) tuples for the kept augmented samples.
-    """
     kept = []
     for method in methods:
         logger.info(f"Running method: {method}")
@@ -212,17 +161,12 @@ def augment_training_split(
         passed = filter_by_similarity(texts, aug_texts, sim_model, threshold)
         logger.info(f"  {method}: {len(passed)}/{len(texts)} samples kept (similarity >= {threshold})")
         for i in passed:
-            # Prevent adding duplicates if the output is exactly the same as the input
             if aug_texts[i].strip() != texts[i].strip():
                 kept.append((aug_texts[i], labels[i]))
 
     return kept
 
-
-# ── Dataset serialisation ─────────────────────────────────────────────────────
-
 def pairs_to_hf_dataset(pairs: list) -> Dataset:
-    """Convert a list of (text, labels) tuples to a HuggingFace Dataset."""
     if not pairs:
         return Dataset.from_dict({TEXT_COL: [], **{e: [] for e in EMOTIONS}})
     texts, labels = zip(*pairs)
@@ -230,9 +174,6 @@ def pairs_to_hf_dataset(pairs: list) -> Dataset:
     for j, emotion in enumerate(EMOTIONS):
         rows[emotion] = [int(lbl[j]) for lbl in labels]
     return Dataset.from_dict(rows)
-
-
-# ── CLI entrypoint ────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Stage 2: data augmentation pipeline")
@@ -244,9 +185,8 @@ def main():
         default=["bt"],
         help="Augmentation methods: bt (back-translation), para (paraphrase)",
     )
-    # Reduced default threshold to 0.75 as cross-lingual similarity models are often strict
     parser.add_argument("--threshold", type=float, default=0.75, help="Similarity threshold")
-    parser.add_argument("--batch_size", type=int, default=16) # Reduced default batch size to save VRAM
+    parser.add_argument("--batch_size", type=int, default=16) 
     parser.add_argument(
         "--verify_labels", action="store_true",
         help="Use Gemini LLM to verify label preservation on augmented samples (slower but cleaner)",
@@ -263,9 +203,6 @@ def main():
     train_texts, train_labels = zip(*splits["train"])
     train_texts, train_labels = list(train_texts), list(train_labels)
 
-    # ── Targeted minority-class augmentation ──────────────────────────────────
-    # Only augment samples that contain at least one minority-class label.
-    # Augmented samples are appended to the FULL original training set.
     minority_texts, minority_labels, minority_mask = identify_minority_samples(
         train_texts, train_labels
     )
@@ -278,7 +215,6 @@ def main():
         sim_model, device, args.threshold, args.batch_size,
     )
 
-    # ── Optional LLM label verification ───────────────────────────────────────
     if args.verify_labels and new_samples:
         logger.info(f"Running Gemini label verification on {len(new_samples)} augmented samples...")
         from filter_gemini import verify_labels_batch
@@ -318,7 +254,5 @@ def main():
     aug_dict.save_to_disk(str(out_path))
     logger.info(f"Augmented dataset saved to {out_path}")
 
-
 if __name__ == "__main__":
     main()
-

@@ -1,8 +1,3 @@
-"""
-Stage 1: Fine-tuning pipeline for multilabel emotion classification.
-Usage: python train.py --model xlm-roberta --lang sw
-"""
-
 import argparse
 import json
 import logging
@@ -38,7 +33,6 @@ SUPPORTED_MODELS = {
     "afroberta": "castorini/afriberta_large",
 }
 
-
 class EmotionDataset(Dataset):
     def __init__(self, texts: list, labels: np.ndarray, tokenizer, max_length: int):
         encodings = tokenizer(
@@ -62,7 +56,6 @@ class EmotionDataset(Dataset):
             "labels": self.labels[idx],
         }
 
-
 class EmotionClassifier(nn.Module):
     def __init__(self, model_name: str, num_labels: int = len(EMOTIONS)):
         super().__init__()
@@ -74,13 +67,8 @@ class EmotionClassifier(nn.Module):
         cls = outputs.last_hidden_state[:, 0, :]
         return self.classifier(cls)
 
-
 def run_epoch(model, loader, criterion, device, optimizer=None, scheduler=None):
-    """
-    Run one epoch. Pass optimizer for training; omit for evaluation.
-    Pass scheduler alongside optimizer for LR stepping during training.
-    Returns (avg_loss, predictions_array, labels_array).
-    """
+    # one lap around the training track
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
@@ -115,12 +103,8 @@ def run_epoch(model, loader, criterion, device, optimizer=None, scheduler=None):
         np.vstack(all_labels),
     )
 
-
 def tune_thresholds(model, loader, device):
-    """
-    Sweep per-label thresholds on a validation set to maximise per-class F1.
-    Returns a numpy array of optimal thresholds, shape (num_labels,).
-    """
+    # finding the sweet spot for each emotion's sensitivity
     model.eval()
     all_logits, all_labels = [], []
     with torch.no_grad():
@@ -149,12 +133,7 @@ def tune_thresholds(model, loader, device):
 
     return np.array(best_thresholds)
 
-
 def evaluate_with_thresholds(model, loader, device, thresholds):
-    """
-    Evaluate model on a data loader using per-label thresholds.
-    Returns (predictions_array, labels_array).
-    """
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
@@ -170,22 +149,15 @@ def evaluate_with_thresholds(model, loader, device, thresholds):
 
     return np.vstack(all_preds), np.vstack(all_labels)
 
-
 def train_and_evaluate(
     train_texts, train_labels, val_texts, val_labels, test_texts, test_labels,
     model_name, args, device, checkpoint_dir, fold_label="",
 ):
-    """
-    Full training pipeline: train with early stopping, tune thresholds, evaluate.
-    Returns (test_metrics_dict, thresholds_list, baseline_dict).
-    """
     prefix = f"[{fold_label}] " if fold_label else ""
 
-    # ── Majority-label baseline ───────────────────────────────────────────────
     baseline = majority_label_baseline(train_labels.astype(int), test_labels.astype(int))
     logger.info(f"{prefix}Majority-label baseline macro-F1: {baseline['macro_f1']:.4f}")
 
-    # ── Tokenisation ──────────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     train_ds = EmotionDataset(train_texts, train_labels, tokenizer, args.max_length)
     val_ds = EmotionDataset(val_texts, val_labels, tokenizer, args.max_length)
@@ -195,14 +167,13 @@ def train_and_evaluate(
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size)
 
-    # ── Model, loss, optimiser, scheduler ─────────────────────────────────────
     model = EmotionClassifier(model_name).to(device)
     pos_weights = compute_pos_weights(train_labels.astype(int)).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
     optimizer = AdamW(model.parameters(), lr=args.lr)
 
     total_steps = len(train_loader) * args.epochs
-    warmup_steps = int(0.1 * total_steps)  # 10% warmup
+    warmup_steps = int(0.1 * total_steps)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
@@ -210,7 +181,6 @@ def train_and_evaluate(
     )
     logger.info(f"{prefix}Scheduler: cosine w/ warmup — {warmup_steps}/{total_steps} warmup steps")
 
-    # ── Training loop with early stopping ─────────────────────────────────────
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / "best_model.pt"
 
@@ -240,11 +210,9 @@ def train_and_evaluate(
                 logger.info(f"{prefix}Early stopping at epoch {epoch}")
                 break
 
-    # ── Per-label threshold tuning on validation set ──────────────────────────
     model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
     thresholds = tune_thresholds(model, val_loader, device)
 
-    # ── Test evaluation with tuned thresholds ─────────────────────────────────
     test_preds, test_true = evaluate_with_thresholds(model, test_loader, device, thresholds)
     test_metrics = compute_metrics(test_true, test_preds)
     test_metrics["majority_label_baseline"] = baseline
@@ -258,7 +226,6 @@ def train_and_evaluate(
         logger.warning(f"{prefix}Model does NOT exceed majority-label baseline")
 
     return test_metrics, thresholds.tolist(), baseline
-
 
 def main():
     parser = argparse.ArgumentParser(description="Train multilabel emotion classifier")
@@ -285,12 +252,8 @@ def main():
     model_name = SUPPORTED_MODELS[args.model]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Limit GPU memory - removed torch.cuda.set_per_process_memory_fraction
-    # as it frequently causes kernel panics/hard crashes on AMD GPUs (ROCm).
-
     logger.info(f"Model: {model_name} | Lang: {args.lang} | Device: {device}")
 
-    # ── Data loading ─────────────────────────────────────────────────────────
     if args.data_dir:
         from datasets import load_from_disk
         raw = load_from_disk(args.data_dir)
@@ -302,7 +265,6 @@ def main():
                 labels = [int(example[e]) for e in EMOTIONS]
                 rows.append((text, labels))
             splits[split_name] = rows
-        # Normalise split key: DatasetDict from augment.py uses "validation"
         if "validation" not in splits and "dev" in splits:
             splits["validation"] = splits.pop("dev")
     else:
@@ -320,22 +282,18 @@ def main():
     val_texts, val_labels = unzip(splits["validation"])
     test_texts, test_labels = unzip(splits["test"])
 
-    # ── Warn if val set is small ──────────────────────────────────────────────
     if len(val_texts) < args.cv_min_val_size and args.cv_folds <= 1:
         logger.warning(
             f"Validation set has only {len(val_texts)} samples (< {args.cv_min_val_size}). "
             f"Consider using --cv_folds 3 for more stable evaluation."
         )
 
-    # ── Output directories ────────────────────────────────────────────────────
     models_dir = Path(args.output_dir) / f"models{args.output_suffix}"
     results_dir = Path(args.output_dir) / f"results{args.output_suffix}"
 
-    # ── Cross-validation mode ─────────────────────────────────────────────────
     if args.cv_folds > 1:
         logger.info(f"Cross-validation mode: {args.cv_folds} folds")
 
-        # Merge train + val for folding
         all_cv_texts = train_texts + val_texts
         all_cv_labels = np.vstack([train_labels, val_labels])
         n = len(all_cv_texts)
@@ -351,7 +309,6 @@ def main():
             logger.info(f"FOLD {fold_idx + 1}/{args.cv_folds}")
             logger.info(f"{'='*60}")
 
-            # Split indices for this fold
             val_start = fold_idx * fold_size
             val_end = val_start + fold_size if fold_idx < args.cv_folds - 1 else n
             fold_val_idx = indices[val_start:val_end]
@@ -375,7 +332,6 @@ def main():
             )
             fold_metrics.append(metrics)
 
-            # Save per-fold results
             fold_results_path = Path(results_dir) / args.model / args.lang / f"fold_{fold_idx + 1}" / "metrics.json"
             fold_results_path.parent.mkdir(parents=True, exist_ok=True)
             with open(fold_results_path, "w") as f:
@@ -385,7 +341,6 @@ def main():
             with open(fold_thresholds_path, "w") as f:
                 json.dump(dict(zip(EMOTIONS, thresholds)), f, indent=2)
 
-        # Aggregate CV results
         macro_f1s = [m["macro_f1"] for m in fold_metrics]
         mean_f1 = float(np.mean(macro_f1s))
         std_f1 = float(np.std(macro_f1s))
@@ -396,7 +351,6 @@ def main():
         logger.info(f"  Per-fold: {[f'{f1:.4f}' for f1 in macro_f1s]}")
         logger.info(f"{'='*60}")
 
-        # Save aggregated results
         cv_results = {
             "cv_folds": args.cv_folds,
             "mean_macro_f1": mean_f1,
@@ -411,7 +365,6 @@ def main():
         logger.info(f"CV results saved → {cv_path}")
 
     else:
-        # ── Standard single-run mode ──────────────────────────────────────────
         checkpoint_dir = Path(models_dir) / args.model / args.lang
 
         test_metrics, thresholds, baseline = train_and_evaluate(
@@ -421,20 +374,17 @@ def main():
             model_name, args, device, checkpoint_dir,
         )
 
-        # Save results
         results_path = Path(results_dir) / args.model / args.lang / "metrics.json"
         results_path.parent.mkdir(parents=True, exist_ok=True)
         with open(results_path, "w") as f:
             json.dump(test_metrics, f, indent=2)
 
-        # Save tuned thresholds
         thresholds_path = results_path.parent / "thresholds.json"
         with open(thresholds_path, "w") as f:
             json.dump(dict(zip(EMOTIONS, thresholds)), f, indent=2)
 
         logger.info(f"Results saved → {results_path}")
         logger.info(f"Thresholds saved → {thresholds_path}")
-
 
 if __name__ == "__main__":
     main()

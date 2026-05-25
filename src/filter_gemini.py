@@ -1,11 +1,3 @@
-"""
-LLM-based label verification filter for augmented data.
-
-Verifies that augmented texts still express the same emotions as their
-originals by asking Gemini to confirm label preservation.
-Used as a second-pass filter after cosine similarity filtering.
-"""
-
 import json
 import logging
 import time
@@ -22,7 +14,6 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-
 def verify_labels_batch(
     texts: List[str],
     original_labels: List[List[int]],
@@ -31,24 +22,6 @@ def verify_labels_batch(
     emotions: List[str] = EMOTIONS,
     batch_size: int = 10,
 ) -> List[bool]:
-    """
-    Verify that augmented texts still express their original emotions.
-
-    Sends batches of texts to Gemini and asks it to confirm whether each text
-    clearly expresses the expected emotions. Returns a boolean list where True
-    means Gemini agrees the emotions are preserved.
-
-    Args:
-        texts: Augmented text samples to verify.
-        original_labels: Corresponding label vectors (list of int lists).
-        lang: Language code for context in the prompt.
-        model: Initialised Gemini GenerativeModel instance.
-        emotions: List of emotion names matching the label indices.
-        batch_size: Number of texts per API call (default 10).
-
-    Returns:
-        List of booleans, one per text. True = labels verified.
-    """
     results = []
 
     for i in range(0, len(texts), batch_size):
@@ -97,7 +70,6 @@ Respond with a JSON array of {len(chunk_texts)} booleans, e.g. [true, false, tru
             logger.error(f"Gemini verify error: {e}")
             results.extend([False] * len(chunk_texts))
 
-        # Respect Gemini free-tier rate limit (15 RPM)
         time.sleep(4.1)
 
     return results
