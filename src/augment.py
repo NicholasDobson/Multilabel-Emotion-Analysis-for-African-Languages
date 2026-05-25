@@ -4,6 +4,7 @@ Stage 2: Modular data augmentation pipeline for multilabel emotion classificatio
 Usage:
   python src/augment.py --lang amh --methods bt
   python src/augment.py --lang afr --methods bt para
+  python src/augment.py --lang amh --methods bt --verify_labels
 """
 
 import argparse
@@ -12,6 +13,7 @@ import sys
 import gc
 from pathlib import Path
 
+import numpy as np
 import torch
 from datasets import Dataset, DatasetDict
 from sentence_transformers import SentenceTransformer, util
@@ -142,6 +144,42 @@ def filter_by_similarity(
     return [i for i, s in enumerate(similarities) if float(s) >= threshold]
 
 
+# ── Minority-class identification ─────────────────────────────────────────────
+
+def identify_minority_samples(train_texts, train_labels):
+    """
+    Identify samples containing at least one minority-class label.
+    Minority labels are those with frequency below the median count.
+
+    Returns:
+        minority_texts: list of texts for minority samples
+        minority_labels: list of label vectors for minority samples
+        minority_mask: boolean array indicating which labels are minority
+    """
+    labels_array = np.array(train_labels)
+    label_counts = labels_array.sum(axis=0)
+    median_count = np.median(label_counts)
+
+    minority_mask = label_counts < median_count
+    minority_label_names = [EMOTIONS[i] for i, m in enumerate(minority_mask) if m]
+    logger.info(f"Label counts: {dict(zip(EMOTIONS, label_counts.astype(int).tolist()))}")
+    logger.info(f"Median count: {median_count:.0f}")
+    logger.info(f"Minority labels (below median): {minority_label_names}")
+
+    # Only keep samples that contain at least one minority label
+    minority_indices = [
+        i for i, lbls in enumerate(train_labels)
+        if any(lbls[j] == 1 for j in range(len(EMOTIONS)) if minority_mask[j])
+    ]
+
+    minority_texts = [train_texts[i] for i in minority_indices]
+    minority_labels = [train_labels[i] for i in minority_indices]
+
+    logger.info(f"Augmenting {len(minority_texts)}/{len(train_texts)} minority samples only")
+
+    return minority_texts, minority_labels, minority_mask
+
+
 # ── Core augmentation loop ────────────────────────────────────────────────────
 
 def augment_training_split(
@@ -209,6 +247,10 @@ def main():
     # Reduced default threshold to 0.75 as cross-lingual similarity models are often strict
     parser.add_argument("--threshold", type=float, default=0.75, help="Similarity threshold")
     parser.add_argument("--batch_size", type=int, default=16) # Reduced default batch size to save VRAM
+    parser.add_argument(
+        "--verify_labels", action="store_true",
+        help="Use Gemini LLM to verify label preservation on augmented samples (slower but cleaner)",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -221,19 +263,48 @@ def main():
     train_texts, train_labels = zip(*splits["train"])
     train_texts, train_labels = list(train_texts), list(train_labels)
 
+    # ── Targeted minority-class augmentation ──────────────────────────────────
+    # Only augment samples that contain at least one minority-class label.
+    # Augmented samples are appended to the FULL original training set.
+    minority_texts, minority_labels, minority_mask = identify_minority_samples(
+        train_texts, train_labels
+    )
+
     logger.info(f"Loading similarity model: {SIMILARITY_MODEL}")
     sim_model = SentenceTransformer(SIMILARITY_MODEL, device=device)
 
     new_samples = augment_training_split(
-        train_texts, train_labels, args.lang, args.methods,
+        minority_texts, minority_labels, args.lang, args.methods,
         sim_model, device, args.threshold, args.batch_size,
     )
+
+    # ── Optional LLM label verification ───────────────────────────────────────
+    if args.verify_labels and new_samples:
+        logger.info(f"Running Gemini label verification on {len(new_samples)} augmented samples...")
+        from filter_gemini import verify_labels_batch
+        from paraphrase_gemini import setup_gemini
+
+        gemini_model = setup_gemini()
+        aug_texts_to_verify = [s[0] for s in new_samples]
+        aug_labels_to_verify = [s[1] for s in new_samples]
+
+        verified = verify_labels_batch(
+            aug_texts_to_verify, aug_labels_to_verify,
+            args.lang, gemini_model, EMOTIONS,
+        )
+
+        pre_filter_count = len(new_samples)
+        new_samples = [s for s, v in zip(new_samples, verified) if v]
+        logger.info(
+            f"Label verification: {len(new_samples)}/{pre_filter_count} samples passed "
+            f"({pre_filter_count - len(new_samples)} rejected)"
+        )
 
     original_n = len(train_texts)
     augmented_n = original_n + len(new_samples)
 
     if augmented_n <= original_n:
-         logger.warning("No augmented samples passed the similarity filter.")
+         logger.warning("No augmented samples passed the filters.")
     else:
          logger.info(f"Train split: {original_n} → {augmented_n} samples ({augmented_n / original_n:.2f}x)")
 

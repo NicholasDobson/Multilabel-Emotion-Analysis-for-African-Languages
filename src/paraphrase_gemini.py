@@ -29,7 +29,7 @@ def setup_gemini():
     genai.configure(api_key=api_key)
 
     # We use Flash because it's fast, free, and excellent at multilingual tasks
-    return genai.GenerativeModel('gemini-2.5-flash')
+    return genai.GenerativeModel('gemini-3.1-flash-lite')
 
 def batch_paraphrase(texts: List[str], lang: str, model, batch_size: int = 20) -> List[str]:
     """Sends batches of texts to Gemini and parses the JSON response."""
@@ -125,7 +125,7 @@ def main():
         "test": Dataset.from_dict({TEXT_COL: [x[0] for x in splits["test"]], **{e: [x[1][j] for x in splits["test"]] for j, e in enumerate(EMOTIONS)}}),
     })
 
-    out_path = Path("data_para") / f"{args.lang}_gemini_augmented"
+    out_path = Path("data") / f"{args.lang}_gemini_augmented"
     aug_dict.save_to_disk(str(out_path))
     logger.info(f"Saved to {out_path}")
 
