@@ -139,6 +139,73 @@ We fine-tune:
 
 ---
 
+## Setup & Usage
+
+### Install dependencies
+```bash
+pip install -r requirements.txt
+#or
+python3 -m pip install -r requirements.txt
+```
+
+
+### Project structure
+```
+src/
+  train.py      # Stage 1 — fine-tuning pipeline
+  augment.py    # Stage 2 — data augmentation
+  explain.py    # Stage 3 — attention visualisation (TODO)
+  utils.py      # shared helpers (metrics, data loading, class weights)
+data/           # downloaded and augmented datasets (gitignored)
+models/         # saved checkpoints (gitignored)
+results/        # metrics per model/language
+outputs/        # attention visualisations (gitignored)
+requirements.txt
+```
+
+### Stage 1 — Train a baseline model
+```bash
+# Baseline Models: mBERT, XLM-RoBERTa-base, and AfroXLMR 
+# Languages Chosen: Afrikaans, Amheric, Swahili, isiZulu, isiXhosa
+# Lang codes Brighter: afr, swa, zul, xho
+# Lang codes Ethio: amh
+
+# Fine-tune XLM-RoBERTa on Swahili Takes far too long 
+python3 src/train.py --model xlm-roberta --lang swa 
+# Smaller version
+python3 src/train.py --model xlm-roberta --lang swh --epochs 2 --batch_size 8
+
+# Fine-tune mBERT on Amharic
+python3 src/train.py --model mbert --lang amh
+
+# Fine-tune AfroXLMR with custom hyperparameters
+python3 src/train.py --model afro-xlmr --lang yor --lr 1e-5 --batch_size 8 --epochs 10
+```
+
+**Available `--model` values:** `mbert`, `xlm-roberta`, `afro-xlmr`
+
+Results are saved to `results/{model}/{lang}/metrics.json`.  
+Best checkpoint is saved to `models/{model}/{lang}/best_model.pt`.
+
+### Stage 2 — Augment training data
+```bash
+# Back-translate Amharic training data and save augmented dataset
+python src/augment.py --lang amh --methods bt
+
+# Train on augmented data
+python src/train.py --model xlm-roberta --lang amh --data_dir data/amh_augmented
+```
+
+``` bash
+# Check cache space from happyface 
+du -sh ~/.cache/huggingface/hub/
+
+# Delete ~3gb cache from running program
+rm -rf ~/.cache/huggingface/hub/
+```
+
+---
+
 ## References
 - BRIGHTER (ACL 2025)  
 - EthioEmo (COLING 2025)  
