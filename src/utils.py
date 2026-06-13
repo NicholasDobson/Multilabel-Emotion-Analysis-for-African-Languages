@@ -1,8 +1,3 @@
-"""
-Shared utilities for multilabel emotion classification.
-Treat metric functions as frozen after Stage 1 — do not modify compute_metrics.
-"""
-
 import logging
 import unicodedata
 from collections import Counter
@@ -21,24 +16,17 @@ DATASET_IDS = {
 }
 
 TEXT_COL = "text"
-# Both datasets load via language config (e.g. "amh", "afr"); LANG_COL is only
-# used as a fallback filter if config-based loading fails.
 LANG_COL = "language"
-
 
 def normalize_text(text: str) -> str:
     return unicodedata.normalize("NFC", text.strip())
 
-
 def _extract_labels(example: dict) -> list:
     return [int(bool(example.get(emotion, 0))) for emotion in EMOTIONS]
 
-
 def _resolve_splits(raw_dataset):
-    """Return (train, val, test) HuggingFace Dataset objects from a DatasetDict."""
     available = set(raw_dataset.keys())
 
-    # BRIGHTER uses "dev" instead of "validation"
     val_key = "validation" if "validation" in available else "dev" if "dev" in available else None
 
     if "train" in available and val_key and "test" in available:
@@ -58,33 +46,20 @@ def _resolve_splits(raw_dataset):
 
     raise ValueError(f"Dataset has no 'train' split; found: {available}")
 
-
 def _load_one_dataset(ds_id: str, lang: str):
-    """
-    Try to load a single HuggingFace dataset for the given language.
-    Returns list of (train_rows, val_rows, test_rows) or None on failure.
-    Each row list contains (text, labels) tuples.
-    """
     from datasets import load_dataset
 
     raw = None
 
-    # Strategy 1: dataset has per-language configs
     try:
         raw = load_dataset(ds_id, lang)
         logger.info(f"Loaded {ds_id} with config '{lang}'")
     except Exception as e:
         err = str(e)
-        # If the error says this language config doesn't exist, skip the dataset
-        # entirely. Falling through to Strategy 2 would trigger an interactive
-        # prompt asking which config to load.
         if "available configs" in err or "Config name is missing" in err:
             logger.warning(f"'{lang}' not available in {ds_id} — skipping")
             return None
 
-    # Strategy 2: load full dataset and filter by language column.
-    # Only reached if Strategy 1 failed for a non-config reason (e.g. a dataset
-    # that has no configs and uses a language column instead).
     if raw is None:
         try:
             full = load_dataset(ds_id)
@@ -118,15 +93,9 @@ def _load_one_dataset(ds_id: str, lang: str):
             rows.append((text, labels))
         result.append(rows)
 
-    return result  # [train_rows, val_rows, test_rows]
-
+    return result
 
 def load_language_data(lang: str) -> dict:
-    """
-    Load and merge data for a language from all configured datasets.
-    Returns {"train": [...], "validation": [...], "test": [...]}
-    where each value is a list of (text: str, labels: list[int]) tuples.
-    """
     splits = {"train": [], "validation": [], "test": []}
     split_keys = list(splits.keys())
 
@@ -137,7 +106,6 @@ def load_language_data(lang: str) -> dict:
         for i, key in enumerate(split_keys):
             splits[key].extend(result[i])
 
-    # Deduplicate each split by normalized text
     for key in split_keys:
         seen = set()
         deduped = []
@@ -150,17 +118,13 @@ def load_language_data(lang: str) -> dict:
 
     return splits
 
-
 def compute_pos_weights(train_labels: np.ndarray) -> torch.Tensor:
-    """Per-class pos_weight = n_neg / n_pos for BCEWithLogitsLoss."""
     n = len(train_labels)
     pos = train_labels.sum(axis=0).clip(min=1)
     neg = n - pos
     return torch.tensor(neg / pos, dtype=torch.float32)
 
-
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    """Compute evaluation metrics. Frozen after Stage 1 — do not modify."""
     num_labels = len(EMOTIONS)
     label_idx = list(range(num_labels))
 
@@ -181,30 +145,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
     return {"macro_f1": macro_f1, "jaccard": jaccard, "per_class": per_class}
 
-
-def find_optimal_thresholds(
-    val_true: np.ndarray, val_probs: np.ndarray, candidates=None
-) -> np.ndarray:
-    """
-    Find the per-class sigmoid threshold that maximises F1 on the validation set.
-    Returns array of shape (num_labels,). Use instead of a fixed 0.5 threshold.
-    """
-    if candidates is None:
-        candidates = np.arange(0.3, 0.71, 0.05)
-    thresholds = []
-    for i in range(val_true.shape[1]):
-        best_t, best_f1 = 0.5, -1.0
-        for t in candidates:
-            preds = (val_probs[:, i] >= t).astype(int)
-            score = f1_score(val_true[:, i], preds, zero_division=0)
-            if score > best_f1:
-                best_f1, best_t = score, float(t)
-        thresholds.append(best_t)
-    return np.array(thresholds)
-
-
 def majority_label_baseline(train_labels: np.ndarray, test_labels: np.ndarray) -> dict:
-    """Predict the most frequent label combination from train for every test example."""
     counter = Counter(tuple(row) for row in train_labels)
     most_common = np.array(counter.most_common(1)[0][0])
     preds = np.tile(most_common, (len(test_labels), 1))
